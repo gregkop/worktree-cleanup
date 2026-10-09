@@ -4,6 +4,8 @@
 # READ-ONLY. This script never deletes, moves, fetches, or rewrites anything.
 # It only runs read-only git plumbing (with optional locks disabled, so even
 # `git status` will not refresh an index) plus find/du/stat.
+# It also runs scan_xcode.sh and scan_cargo.sh, which are read-only too.
+# --plan prints removal commands; it never runs them.
 #
 # Portable: bash 3.2+ (macOS default) and Linux, stock tools + git.
 # License: MIT. https://github.com/gregkop/worktree-cleanup (see README)
@@ -11,15 +13,20 @@
 set -u
 export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 LC_ALL=C
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 MAX_DEPTH=6
 AGENT_DEPTH=6
 STALE_DAYS=7
+XCODE_STALE_DAYS=14
 OUTPUT="text"          # text | json | plan
 DO_SIZE=1
 DO_AGENT_DIRS=1
+DO_XCODE=1
+DO_CARGO=1
 ROOTS=()
 EXTRA_DIRS=()
+CARGO_ROOTS=""
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
   cat <<'EOF'
@@ -43,8 +50,20 @@ Options:
   --no-agent-dirs    Do not scan the built-in agent worktree locations.
   --agent-dir PATH   Extra folder that holds worktrees (repeatable), e.g. a
                      custom Codex/Superset worktree root.
+  --no-xcode         Do not report Xcode DerivedData or iOS simulators.
+  --xcode-stale-days N
+                     DerivedData untouched this many days is stale (default 14).
+  --no-cargo         Do not report Cargo target/ directories.
   -h, --help         Show this help.
   --version          Show version.
+
+Also reported (still read-only; cleanup commands appear only in --plan):
+  Xcode / iOS   On macOS: DerivedData, unavailable simulators, DeviceSupport,
+                Archives size. Skipped on Linux. Archives are never planned.
+  Cargo         target/ next to a Cargo.toml in the repos and worktrees found
+                above. If CARGO_TARGET_DIR is set, that directory is reported
+                instead. ~/.cargo registry cache and git checkouts are sizes
+                only.
 
 Verdicts:
   SAFE    Directory already gone (prunable), or: clean working tree, every
@@ -68,6 +87,9 @@ while [ $# -gt 0 ]; do
     --no-size) DO_SIZE=0 ;;
     --no-agent-dirs) DO_AGENT_DIRS=0 ;;
     --agent-dir) shift; [ -n "${1:-}" ] || die "--agent-dir needs a path"; EXTRA_DIRS+=("$1") ;;
+    --no-xcode) DO_XCODE=0 ;;
+    --xcode-stale-days) shift; is_uint "${1:-}" || die "--xcode-stale-days needs a number"; XCODE_STALE_DAYS=$1 ;;
+    --no-cargo) DO_CARGO=0 ;;
     -h|--help) usage; exit 0 ;;
     --version) printf '%s\n' "$VERSION"; exit 0 ;;
     --) shift; while [ $# -gt 0 ]; do ROOTS+=("$1"); shift; done; break ;;
@@ -122,6 +144,10 @@ json_str() {
 json_num_or_null() { if is_uint "${1:-}"; then printf '%s' "$1"; else printf 'null'; fi; }
 json_bool() { if [ "${1:-0}" = 1 ]; then printf 'true'; else printf 'false'; fi; }
 in_list() { case "$NL$2$NL" in *"$NL$1$NL"*) return 0;; esac; return 1; }
+add_cargo_root() {
+  [ -n "${1:-}" ] && [ -d "$1" ] || return 0
+  in_list "$1" "$CARGO_ROOTS" || CARGO_ROOTS="$CARGO_ROOTS${CARGO_ROOTS:+$NL}$1"
+}
 
 CODEX_DIR=${CODEX_HOME:-$HOME/.codex}
 TMP_BASE=${TMPDIR:-/tmp}; TMP_BASE=${TMP_BASE%/}
@@ -269,7 +295,7 @@ PWD_C=$(pwd -P)
 add_reason() { reasons="$reasons${reasons:+$US}$1"; verdict=REVIEW; }
 
 inspect_repo() {   # $1 = canonical git common dir
-  local common=$1 porcelain main="" targets="" t oh lb b has_remotes pid_cache="" pid_cache_done=0
+  local common=$1 porcelain main="" targets="" t oh lb b has_remotes pid_cache="" pid_cache_done=0 cr
   local -a R_WT R_HEAD R_BRANCH R_LOCKED R_LOCKR R_PRUNE
   local i=-1 line
   porcelain=$(git --git-dir="$common" worktree list --porcelain 2>/dev/null) || return
@@ -286,6 +312,11 @@ inspect_repo() {   # $1 = canonical git common dir
   done <<EOF
 $porcelain
 EOF
+  if [ "$i" -ge 0 ]; then
+    for ((cr = 0; cr <= i; cr++)); do
+      [ -n "${R_WT[cr]}" ] && [ -d "${R_WT[cr]}" ] && add_cargo_root "${R_WT[cr]}"
+    done
+  fi
   [ "$i" -ge 1 ] || return   # no linked worktrees
   REPO_COUNT=$((REPO_COUNT + 1))
   main=${R_WT[0]}; [ -n "$main" ] || main=$common
@@ -441,6 +472,7 @@ while IFS= read -r o; do
   [ -n "$o" ] || continue
   gd=$(sed -n 's/^gitdir: //p' "$o/.git" 2>/dev/null | head -n 1)
   repo=${gd%/.git/worktrees/*}; [ "$repo" = "$gd" ] && repo="?"
+  add_cargo_root "$o"
   measure "$o"
   last=$(file_mtime "$o")
   add_row "$o" "$repo" "" "" "$(tool_for_path "$o")" orphan "$M_SIZE" "$M_REGEN" "$last" "" "" "" "" 0 "" REVIEW \
@@ -550,7 +582,51 @@ print_text() {
 $SCANNED_AGENT_DIRS
 EOF
   fi
-  printf '\nNothing was modified. Use --plan to print removal commands for SAFE rows, --json for machine output.\n'
+  printf '\nNothing was modified. Use --plan to print removal commands for SAFE worktrees, SAFE DerivedData, and Cargo targets. Use --json for machine output.\n'
+}
+
+section_off_json() { printf '{"skipped":true,"reason":%s}\n' "$(json_str "$1")"; }
+
+run_xcode() { # $1 = text|json|plan
+  local mode=$1
+  local args
+  if [ "$DO_XCODE" != 1 ]; then
+    [ "$mode" = json ] && section_off_json "disabled (--no-xcode)"
+    return 0
+  fi
+  if [ ! -f "$SCRIPT_DIR/scan_xcode.sh" ]; then
+    warn "scan_xcode.sh not found; skipping Xcode caches"
+    [ "$mode" = json ] && section_off_json "scanner missing"
+    return 0
+  fi
+  args=(--stale-days "$XCODE_STALE_DAYS")
+  [ "$DO_SIZE" = 0 ] && args+=(--no-size)
+  case $mode in
+    json) args+=(--json) ;;
+    plan) args+=(--plan) ;;
+  esac
+  bash "$SCRIPT_DIR/scan_xcode.sh" "${args[@]}"
+}
+
+run_cargo() { # $1 = text|json|plan
+  local mode=$1
+  local args
+  if [ "$DO_CARGO" != 1 ]; then
+    [ "$mode" = json ] && section_off_json "disabled (--no-cargo)"
+    return 0
+  fi
+  if [ ! -f "$SCRIPT_DIR/scan_cargo.sh" ]; then
+    warn "scan_cargo.sh not found; skipping Cargo targets"
+    [ "$mode" = json ] && section_off_json "scanner missing"
+    return 0
+  fi
+  args=(--stdin --depth "$MAX_DEPTH")
+  [ "$DO_SIZE" = 0 ] && args+=(--no-size)
+  case $mode in
+    json) args+=(--json) ;;
+    plan) args+=(--plan) ;;
+  esac
+  printf '%s\n' "$CARGO_ROOTS" | bash "$SCRIPT_DIR/scan_cargo.sh" "${args[@]}"
 }
 
 print_plan() {
@@ -580,7 +656,7 @@ EOF
 }
 
 print_json() {
-  local j first=1 parts p
+  local j first=1 parts p xjson cjson
   printf '{\n  "tool": "worktree-cleanup/scan_worktrees.sh",\n  "version": %s,\n  "generated_at": %s,\n' "$(json_str "$VERSION")" "$NOW"
   printf '  "stale_days": %s,\n  "roots": [' "$STALE_DAYS"
   for r in "${ROOTS[@]}"; do [ $first = 1 ] || printf ', '; first=0; json_str "$r"; done
@@ -619,11 +695,28 @@ print_json() {
     done
     printf ']}'
   done
-  printf '\n  ]\n}\n'
+  printf '\n  ],\n'
+  xjson=$(run_xcode json)
+  cjson=$(run_cargo json)
+  [ -n "$xjson" ] || xjson='{"skipped":true,"reason":"scanner failed"}'
+  [ -n "$cjson" ] || cjson='{"skipped":true,"reason":"scanner failed"}'
+  printf '  "xcode": %s,\n  "cargo": %s\n}\n' "$xjson" "$cjson"
 }
 
 case $OUTPUT in
   json) print_json ;;
-  plan) print_plan ;;
-  *) print_text ;;
+  plan)
+    print_plan
+    printf '\n'
+    run_xcode plan
+    printf '\n'
+    run_cargo plan
+    ;;
+  *)
+    print_text
+    printf '\n'
+    run_xcode text
+    printf '\n'
+    run_cargo text
+    ;;
 esac

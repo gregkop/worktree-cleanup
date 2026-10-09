@@ -16,7 +16,7 @@ mkdir -p "$H/code" "$SB/remotes"
 export GIT_AUTHOR_NAME=sandbox GIT_AUTHOR_EMAIL=sandbox@example.com
 export GIT_COMMITTER_NAME=sandbox GIT_COMMITTER_EMAIL=sandbox@example.com
 export GIT_CONFIG_NOSYSTEM=1 HOME="$H"
-unset CODEX_HOME TMPDIR
+unset CODEX_HOME TMPDIR CARGO_HOME CARGO_TARGET_DIR CARGO_BUILD_RUNNING XCODE_SCAN_ENABLE XCODE_RUNNING
 g() { git -c init.defaultBranch=main -c advice.detachedHead=false "$@"; }
 
 old_stamp=$(date -d '30 days ago' +%Y%m%d%H%M 2>/dev/null || date -v-30d +%Y%m%d%H%M)

@@ -21,3 +21,7 @@ Checked October 2026 against vendor docs or source code. Defaults change; if a t
 - **Crystal `~/.crystal/worktrees`.** Only mentioned in a third-party summary (DeepWiki). The source code uses `<repo>/worktrees`.
 - **Cloud agents** (Cursor Cloud Agents, Codex cloud, GitHub Copilot coding agent, Jules, Devin). They run in remote sandboxes and leave nothing on the local disk.
 - **Windsurf, Amp, OpenCode, Aider, Sculptor, Nimbalyst, and others.** No documented default local worktree folder was found. Their worktrees, if any, still show up through the parent repo's `git worktree list` as long as the repo sits under a scanned root.
+
+## Related disk use
+
+Xcode DerivedData, iOS simulators, and Cargo `target/` directories are not worktrees. The same scan reports them separately. See [xcode-caches.md](xcode-caches.md) and [cargo-targets.md](cargo-targets.md).

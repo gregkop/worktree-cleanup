@@ -1,11 +1,11 @@
 ---
 name: worktree-cleanup
-description: Find and safely clean up stale git worktrees and related disk bloat left behind by AI coding agents (Cursor, Claude Code, Codex, Conductor, Superset, VS Code, and similar). Use when the user is low on disk space, says their drive is mysteriously full, asks what is eating their disk, mentions lots of git worktrees, or after heavy parallel agent use. Scans read-only, reports size and a SAFE/REVIEW verdict for every worktree, and removes worktrees with `git worktree remove` only after the user explicitly confirms.
+description: Find and safely clean up stale git worktrees and related disk bloat left behind by AI coding agents (Cursor, Claude Code, Codex, Conductor, Superset, VS Code, and similar), plus Xcode DerivedData, unavailable iOS simulators, and Cargo target directories. Use when the user is low on disk space, says their drive is mysteriously full, asks what is eating their disk, mentions lots of git worktrees, Xcode DerivedData, iOS simulators, or Rust build output, or after heavy parallel agent use. Scans read-only, reports size and a SAFE/REVIEW verdict, and removes anything only after the user explicitly confirms.
 license: MIT
-compatibility: macOS or Linux with git and bash (3.2+). No network access needed.
+compatibility: macOS or Linux with git and bash (3.2+). Xcode and simulator checks run on macOS only. No network access needed.
 metadata:
   author: Greg Kopyltsov
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
 # Worktree Cleanup
@@ -20,6 +20,11 @@ AI coding agents create a git worktree for every parallel task and often leave i
 4. **No `--force`, no `git worktree unlock`, no branch deletion** unless the user asks for that action on that exact item, after you have shown what would be lost.
 5. **Do not touch remotes without asking.** No push. `git fetch --prune` updates refs and makes "merged/gone" detection more accurate, so offer it, but only run it if the user agrees.
 6. **Leave active worktrees alone.** Skip the worktree you are running in, anything locked, and anything touched recently. Ask the user to close agent sessions or IDE windows that use a worktree before you remove it.
+7. **A yes for one group is not a yes for the others.** Worktrees, Xcode DerivedData, unavailable simulators, and Cargo targets are separate lists. Ask once per group.
+8. **DerivedData only when Xcode is quit.** If `pgrep -x Xcode` finds Xcode, do not delete DerivedData. Tell the user and wait until Xcode is quit, then re-scan. Remove only the child folders the scan marked SAFE, and only those, with `rm -rf` of that path. Never delete `~/Library/Developer/Xcode/Archives`.
+9. **Simulators go through simctl.** For unavailable devices run `xcrun simctl delete unavailable`. Do not `rm` anything under `~/Library/Developer/CoreSimulator`.
+10. **iOS DeviceSupport is report-only** unless the user names those folders. Archives are never deleted.
+11. **Cargo `target/` is regenerable, with a narrow path.** Only a directory named `target` whose parent contains a `Cargo.toml`, or the directory `CARGO_TARGET_DIR` points at. Prefer `cargo clean --manifest-path <Cargo.toml>` when `cargo` is on PATH; otherwise remove that target directory. If `cargo` or `rustc` is running, leave every target alone. Do not delete `~/.cargo/registry` or `~/.cargo/git` unless the user asks for that as its own step.
 
 ## Step 1: Get a baseline
 
@@ -35,8 +40,11 @@ Run the bundled scanner from this skill's directory (the folder that contains th
 bash <skill-dir>/scripts/scan_worktrees.sh            # searches $HOME + known agent folders
 bash <skill-dir>/scripts/scan_worktrees.sh ~/code ~/src --stale-days 14
 bash <skill-dir>/scripts/scan_worktrees.sh --json      # machine-readable
-bash <skill-dir>/scripts/scan_worktrees.sh --plan      # prints (never runs) removal commands for SAFE rows
+bash <skill-dir>/scripts/scan_worktrees.sh --plan      # prints (never runs) removal commands
+bash <skill-dir>/scripts/scan_worktrees.sh --xcode-stale-days 30
 ```
+
+The same command appends two more read-only sections: Xcode and iOS caches (macOS only; one skipped line on Linux) and Cargo `target/` directories in the repos and worktrees it found. `--no-xcode` and `--no-cargo` turn those sections off. Details are in [references/xcode-caches.md](references/xcode-caches.md) and [references/cargo-targets.md](references/cargo-targets.md).
 
 How the scanner works:
 - It finds repos under each ROOT (default `$HOME`, depth 6). It skips `node_modules`, `~/Library`, most dot-folders, and build or dependency dirs.
@@ -98,6 +106,8 @@ REVIEW (has work in it, or still in use): 3 worktrees, 9.8 GB
 
 Then ask one clear question, for example: *"Remove the 5 SAFE worktrees (41.2 GB)? Reply 'yes', list the numbers to remove, or 'none'. I won't touch REVIEW items unless you tell me what to do with each."* For each REVIEW item, offer options instead of acting: commit and push, keep it, or (if the user explicitly says so) discard it.
 
+If the report also has Xcode or Cargo sections, ask about those separately after the worktree question. Do not treat one yes as covering both.
+
 ## Step 5: Remove, only what was approved
 
 For each approved worktree, run this from its parent repo:
@@ -125,11 +135,33 @@ Explicit user overrides, one item at a time:
 
 Finally, re-run the scanner and `df -h ~`, and report how much space was freed.
 
-## Step 6: Other agent disk hogs (report only)
+## Step 6: Xcode and iOS caches (macOS)
+
+On Linux, or on a Mac with no Xcode, the scanner prints one skipped line and you move on. On macOS it reports:
+
+- **DerivedData** (`~/Library/Developer/Xcode/DerivedData`, or the custom location from Xcode's settings when `defaults` can read it): total size, then each project folder with size and idle days. **SAFE** when Xcode is not running and either the folder has been untouched for at least `--xcode-stale-days` (default 14) or its `info.plist` `WorkspacePath` points at a project that is gone. **REVIEW** when it was used recently, the workspace path cannot be read, or Xcode is running. A running Xcode turns every DerivedData row into REVIEW.
+- **Unavailable simulators** from `xcrun simctl list devices unavailable`, with disk use under `~/Library/Developer/CoreSimulator/Devices/<UDID>` when that directory exists. These are SAFE to remove with simctl even if Xcode is open. The scanner does not `rm` them.
+- **Unavailable runtimes** from `xcrun simctl list runtimes`, report only. Mention `xcrun simctl runtime delete` only if the user names one.
+- **iOS DeviceSupport**, report only, with versions older than `--xcode-stale-days` flagged.
+- **Archives**, one total size, report only. Never put Archives on a removal list.
+
+Show the SAFE DerivedData rows and the unavailable simulators with sizes, then ask. After a yes for that list, run the commands from `--plan` for those rows only: `rm -rf` of each SAFE DerivedData child, and one `xcrun simctl delete unavailable` if any unavailable device was listed. If Xcode is running, there is no DerivedData `rm` in the plan. Re-run the scanner and `df -h ~` when you are done.
+
+## Step 7: Cargo build output
+
+In every repo and worktree the scan already found, a `target/` directory counts only when a `Cargo.toml` is in its parent. The report includes size and idle days. Those directories are regenerable, so they are **SAFE** unless `cargo` or `rustc` is running, in which case every row is **REVIEW** and `--plan` prints no cleanup.
+
+If `CARGO_TARGET_DIR` is set and that directory exists, the scanner reports that shared directory instead of the per-project `target/` folders, so the same bytes are not counted twice. One `cargo clean` clears it, because cargo honors `CARGO_TARGET_DIR`.
+
+`~/.cargo/registry/cache` and `~/.cargo/git/checkouts` (or the same paths under `$CARGO_HOME`) are sizes only. They are not in `--plan`.
+
+Ask before cleaning. Prefer the plan's `cargo clean --manifest-path <Cargo.toml>` when `cargo` is on PATH. If it is not, the plan has `rm -rf` of the adjacent `target` directory (or of `CARGO_TARGET_DIR` itself). Do not invent a broader delete. A `target/` with no `Cargo.toml` beside it is not yours to remove.
+
+## Step 8: Other agent disk hogs (report only)
 
 Mention these with sizes, but do not delete them unless asked:
-- **Regenerable dirs inside kept worktrees** (the scanner's "Regenerable" total): `node_modules`, `.venv`, `target`, `.next`, `build`. Deleting just these frees space and keeps the work.
-- **Package manager and build caches** (measure with `du -sh`). If the user wants them gone, suggest the tool's own cleanup command: `~/.npm` (`npm cache clean --force`), pnpm store (`pnpm store prune`), `~/.cache/uv` (`uv cache clean`), `~/.cache/pip` (`pip cache purge`), `~/.cargo/registry`, `~/.gradle/caches`, Xcode `~/Library/Developer/Xcode/DerivedData`, Docker (`docker system df` to inspect; `docker system prune` is destructive).
+- **Regenerable dirs inside kept worktrees** (the scanner's "Regenerable" total): `node_modules`, `.venv`, `.next`, `build`. Cargo `target/` directories that sit next to a `Cargo.toml` are handled in Step 7, not here.
+- **Package manager and build caches** (measure with `du -sh`). If the user wants them gone, suggest the tool's own cleanup command: `~/.npm` (`npm cache clean --force`), pnpm store (`pnpm store prune`), `~/.cache/uv` (`uv cache clean`), `~/.cache/pip` (`pip cache purge`), `~/.gradle/caches`, Docker (`docker system df` to inspect; `docker system prune` is destructive). Cargo registry and git checkouts are already measured in Step 7; still do not delete them unless asked. Xcode DerivedData and simulators are Step 6, not this list.
 - **Agent state folders** such as `~/.claude` and `~/.codex` can grow from session transcripts. Report their size only; they hold the user's history.
 
 To prevent a repeat, suggest the tools' own retention settings: Cursor `cursor.worktreeMaxCount` and `cursor.worktreeCleanupIntervalHours`, Claude Code `cleanupPeriodDays`, and archiving finished workspaces in Conductor, Superset, and Vibe Kanban.
@@ -147,4 +179,16 @@ git -C <wt> status --porcelain                   # empty means clean
 git -C <wt> rev-list --count HEAD --not --remotes   # 0 means nothing unpushed
 git -C <repo> merge-base --is-ancestor <wt-HEAD> origin/main && echo merged
 git -C <repo> for-each-ref --format='%(upstream:track)' refs/heads/<branch>   # [gone] = deleted upstream
+
+# Xcode (macOS). Measure only until the user approves a list.
+pgrep -x Xcode && echo "Xcode is running"
+du -sh ~/Library/Developer/Xcode/DerivedData/*
+du -sh ~/Library/Developer/Xcode/Archives
+xcrun simctl list devices unavailable
+# after a yes: xcrun simctl delete unavailable
+# after a yes, and only if Xcode is quit: rm -rf <one SAFE DerivedData child>
+
+# Cargo. Only target/ next to a Cargo.toml, or $CARGO_TARGET_DIR.
+du -sh <project>/target
+# after a yes: cargo clean --manifest-path <project>/Cargo.toml
 ```

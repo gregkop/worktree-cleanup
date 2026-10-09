@@ -2,7 +2,7 @@
 
 **AI coding agents love spinning up git worktrees and never cleaning them up.**
 
-This is an [Agent Skill](https://agentskills.io) that lets your coding agent (Claude Code, Cursor, Codex, and other tools that support `SKILL.md`) find every stale worktree on your machine, measure it, and tell you which ones are safe to delete. It removes them only after you say yes.
+This is an [Agent Skill](https://agentskills.io) that lets your coding agent (Claude Code, Cursor, Codex, and other tools that support `SKILL.md`) find every stale worktree on your machine, measure it, and tell you which ones are safe to delete. It removes them only after you say yes. On a Mac it also reports Xcode DerivedData and unavailable iOS simulators. In any repo it scans, it reports Cargo `target/` directories the same way.
 
 Tell your agent *"I'm low on disk space"* and it will:
 
@@ -63,6 +63,7 @@ bash ~/.agents/skills/worktree-cleanup/scripts/scan_worktrees.sh          # scan
 bash .../scan_worktrees.sh ~/code --stale-days 14                         # narrower, stricter
 bash .../scan_worktrees.sh --json                                         # for scripts and agents
 bash .../scan_worktrees.sh --plan                                         # print (never run) removal commands
+bash .../scan_worktrees.sh --xcode-stale-days 30                         # DerivedData stale threshold
 ```
 
 ## Example output
@@ -97,8 +98,11 @@ Agent worktree locations found:
   superset      ~/.superset/worktrees                           1 worktree(s)  0K
   claude-squad  ~/.claude-squad/worktrees                       1 worktree(s)  20K
 
-Nothing was modified. Use --plan to print removal commands for SAFE rows, --json for machine output.
+Nothing was modified. Use --plan to print removal commands for SAFE worktrees, SAFE DerivedData, and Cargo targets. Use --json for machine output.
 ```
+
+On Linux that run continues with two short sections: Xcode is skipped, and Cargo reports whatever `target/` directories (none, in this sandbox) sit next to a `Cargo.toml`.
+
 
 ## How verdicts are decided
 
@@ -107,6 +111,30 @@ Nothing was modified. Use --plan to print removal commands for SAFE rows, --json
 | **SAFE** | The directory is already gone (prunable metadata), **or** all of these hold: no modified or untracked files; HEAD is merged into the default branch (by ancestry, rebase, or squash patch-id match), or every commit is already on a remote and the upstream branch was deleted or HEAD is detached; not locked; idle at least `--stale-days` (default 7). |
 | **REVIEW** | Anything else: dirty, unpushed or unmerged commits, pushed but not merged (open PR?), locked, recently active, it's your current directory, has submodules, orphaned (its repo was deleted), or couldn't be inspected. |
 
+## Xcode and iOS caches (macOS)
+
+Macs that build with Xcode, especially ones shared with coding agents, fill up with DerivedData and simulators that no project still uses. The scanner reports them only on macOS. On Linux it prints one skipped line and continues with the rest of the report.
+
+| What | Verdict | Cleanup, after you say yes |
+|---|---|---|
+| DerivedData project folder, untouched for at least 14 days (`--xcode-stale-days`) | **SAFE**, if Xcode is not running | `rm -rf` of that folder only |
+| DerivedData folder whose `info.plist` `WorkspacePath` points at a project that is gone | **SAFE**, even if it is newer, if Xcode is not running | same |
+| DerivedData while `pgrep -x Xcode` finds Xcode, or a folder used recently | **REVIEW** | none until Xcode is quit and you re-scan |
+| Unavailable simulators (`xcrun simctl list devices unavailable`) and their size under `~/Library/Developer/CoreSimulator/Devices` | **SAFE** | `xcrun simctl delete unavailable` |
+| Unavailable simulator runtimes | report only | only if you name one (`xcrun simctl runtime delete`) |
+| iOS DeviceSupport versions older than the stale threshold | report only | only if you name those folders |
+| `~/Library/Developer/Xcode/Archives` | report only, one total | never |
+
+DerivedData is regenerable. Archives are not treated that way: the plan never lists them. Simulator device directories are not removed with `rm`. If you moved DerivedData in Xcode's Locations settings, the scanner follows that path when `defaults` can read it, or you can set `XCODE_DERIVED_DATA`.
+
+## Cargo build output
+
+Agent worktrees of Rust projects keep a full `target/` tree each. The scanner looks in the repos and worktrees it already found. A `target` directory counts only when a `Cargo.toml` is in the same parent. It reports size and age, and marks that directory **SAFE** because `cargo` can rebuild it. If `cargo` or `rustc` is running, the rows are **REVIEW** and the plan is empty.
+
+When `CARGO_TARGET_DIR` is set and the directory exists, that shared folder is reported instead of every project's `target/`, so the same files are not counted twice. One `cargo clean` clears it.
+
+The plan prefers `cargo clean --manifest-path <Cargo.toml>` when `cargo` is on PATH. Otherwise it removes that target directory. `~/.cargo/registry/cache` and `~/.cargo/git/checkouts` (under `$CARGO_HOME` if you set it) are sizes only and are not in the plan.
+
 ## Safety
 
 - **The scanner is read-only.** It never deletes, moves, fetches, or pushes. It sets `GIT_OPTIONAL_LOCKS=0` so even `git status` won't rewrite an index.
@@ -114,20 +142,23 @@ Nothing was modified. Use --plan to print removal commands for SAFE rows, --json
 - **Removal uses `git worktree remove` without `--force`.** Git itself refuses to delete a worktree with modified or untracked files, or one that is locked.
 - **Branches are kept.** Removing a worktree does not delete its branch.
 - **Ignored files go with the worktree.** That includes `.env` copies, `node_modules`, and build output. The agent warns you when this matters.
-- **Caches are report-only.** Other disk hogs (npm/pnpm/uv caches, Docker, Xcode DerivedData) are listed with sizes and never deleted.
+- **Xcode DerivedData and Cargo targets are regenerable, and still need a yes.** The plan lists only SAFE DerivedData children (and only when Xcode is not running), one `xcrun simctl delete unavailable` when simulators are unavailable, and `cargo clean` or a matching `rm` of an adjacent `target/`. Archives, iOS DeviceSupport, unavailable runtimes, and the Cargo registry and git checkouts are report-only.
+- **Other caches stay report-only.** npm/pnpm/uv caches and Docker are listed with sizes when you ask, and are not part of this plan.
 
 ## Requirements
 
-macOS or Linux, `git` (2.31+ recommended), and bash 3.2+ (the stock macOS bash works). No other dependencies and no network access.
+macOS or Linux, `git` (2.31+ recommended), and bash 3.2+ (the stock macOS bash works). The Xcode and simulator section needs macOS; `xcrun` is used when it is installed and skipped when it is not. Cargo cleanup uses `cargo` when it is on PATH. No other dependencies and no network access.
 
 ## Development
 
 ```bash
 tests/sandbox_test.sh            # builds a throwaway sandbox of repos and worktrees and checks every verdict
+tests/xcode_test.sh              # DerivedData, simulators, archives; stubs xcrun so it runs on Linux
+tests/cargo_test.sh              # adjacent target/ dirs, CARGO_TARGET_DIR, cargo clean vs rm
 shellcheck scripts/*.sh tests/*.sh
 ```
 
-Agent worktree paths and their sources are in [`references/agent-locations.md`](references/agent-locations.md). PRs for more tools are welcome. Please include a link to docs or source.
+Agent worktree paths and their sources are in [`references/agent-locations.md`](references/agent-locations.md). Xcode paths and Cargo target rules are in [`references/xcode-caches.md`](references/xcode-caches.md) and [`references/cargo-targets.md`](references/cargo-targets.md). PRs for more tools are welcome. Please include a link to docs or source.
 
 ## License
 
